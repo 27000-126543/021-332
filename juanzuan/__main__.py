@@ -8,7 +8,8 @@ from .scanner import scan_project, generate_checklist, generate_preliminary_list
 from .organizer import (
     parse_checklist, merge_with_scan, build_action_plan, execute_actions,
     print_preview, generate_volume_catalog, generate_missing_report,
-    generate_summary_report, generate_monthly_summary
+    generate_summary_report, generate_monthly_summary, verify_organized_result,
+    verify_batch_output
 )
 
 
@@ -228,9 +229,12 @@ def cmd_list_types(args):
         print()
 
 
-def process_single_project(project_dir, project_name, project_type_code, parent_output, copy_mode):
+def process_single_project(project_dir, project_name, project_type_code, output_path, copy_mode, force_project_output=None):
     project_path = os.path.abspath(project_dir)
-    project_output = os.path.join(parent_output, project_name + "_组卷结果")
+    if force_project_output:
+        project_output = os.path.abspath(force_project_output)
+    else:
+        project_output = os.path.join(output_path, project_name + "_组卷结果")
 
     pt = get_project_type(project_type_code)
     if not pt:
@@ -297,75 +301,148 @@ def process_single_project(project_dir, project_name, project_type_code, parent_
     return result_dict
 
 
+def parse_project_list(csv_path: str) -> List[Dict]:
+    import csv
+    projects = []
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"项目清单文件不存在: {csv_path}")
+
+    with open(csv_path, 'r', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if not row:
+                continue
+            name = (row.get('项目名称') or row.get('name') or '').strip()
+            path = (row.get('路径') or row.get('path') or '').strip()
+            ptype = (row.get('工程类型') or row.get('type') or '').strip()
+            output = (row.get('输出目录') or row.get('output') or '').strip()
+            remark = (row.get('备注') or row.get('remark') or '').strip()
+
+            if not name or not path or not ptype:
+                continue
+
+            projects.append({
+                'name': name,
+                'path': path,
+                'type': ptype,
+                'output': output,
+                'remark': remark
+            })
+    return projects
+
+
 def cmd_batch(args):
     batch_dir = args.batch_dir
     project_type = args.project_type
     output_path = args.output
     copy_mode = not args.move
     preview = args.preview
-
-    if not os.path.isabs(batch_dir):
-        batch_dir = os.path.abspath(batch_dir)
+    project_list = args.project_list
 
     if not os.path.isabs(output_path):
         output_path = os.path.abspath(output_path)
 
-    pt = get_project_type(project_type)
-    if not pt:
-        print(f"错误: 不支持的工程类型 '{project_type}'")
-        sys.exit(1)
-
     print("=" * 60)
     print("竣工资料组卷工具 - 批量项目模式")
     print("=" * 60)
-    print(f"批量目录: {batch_dir}")
-    print(f"工程类型: {pt.name}")
-    print(f"输出位置: {output_path}")
-    print(f"处理模式: {'复制' if copy_mode else '移动'}")
-    print(f"运行方式: {'预览' if preview else '正式执行'}")
-    print()
 
-    if not os.path.isdir(batch_dir):
-        print(f"错误: 批量目录不存在: {batch_dir}")
-        sys.exit(1)
+    projects_from_list = []
+    if project_list:
+        print(f"项目清单: {project_list}")
+        print(f"输出位置: {output_path}")
+        print(f"处理模式: {'复制' if copy_mode else '移动'}")
+        print(f"运行方式: {'预览' if preview else '正式执行'}")
+        print()
 
-    project_dirs = []
-    for item in sorted(os.listdir(batch_dir)):
-        item_path = os.path.join(batch_dir, item)
-        if os.path.isdir(item_path):
-            has_files = any(
-                os.path.isfile(os.path.join(root, f))
-                for root, dirs, files in os.walk(item_path)
-                for f in files
+        if not os.path.isabs(project_list):
+            project_list = os.path.abspath(project_list)
+
+        try:
+            projects_from_list = parse_project_list(project_list)
+        except Exception as e:
+            print(f"错误: 解析项目清单失败: {e}")
+            sys.exit(1)
+
+        if not projects_from_list:
+            print("错误: 项目清单中没有有效的项目")
+            sys.exit(1)
+
+        print(f"从清单中读取到 {len(projects_from_list)} 个项目:")
+        for p in projects_from_list:
+            pt = get_project_type(p['type'])
+            pt_name = pt.name if pt else f"未知({p['type']})"
+            remark = f" ({p['remark']})" if p['remark'] else ""
+            print(f"  - {p['name']} [{pt_name}] {p['path']}{remark}")
+        print()
+    else:
+        if not os.path.isabs(batch_dir):
+            batch_dir = os.path.abspath(batch_dir)
+
+        pt = get_project_type(project_type)
+        if not pt:
+            print(f"错误: 不支持的工程类型 '{project_type}'")
+            sys.exit(1)
+
+        print(f"批量目录: {batch_dir}")
+        print(f"工程类型: {pt.name}")
+        print(f"输出位置: {output_path}")
+        print(f"处理模式: {'复制' if copy_mode else '移动'}")
+        print(f"运行方式: {'预览' if preview else '正式执行'}")
+        print()
+
+        if not os.path.isdir(batch_dir):
+            print(f"错误: 批量目录不存在: {batch_dir}")
+            sys.exit(1)
+
+        project_dirs = []
+        for item in sorted(os.listdir(batch_dir)):
+            item_path = os.path.join(batch_dir, item)
+            if os.path.isdir(item_path):
+                has_files = any(
+                    os.path.isfile(os.path.join(root, f))
+                    for root, dirs, files in os.walk(item_path)
+                    for f in files
+                )
+                if has_files:
+                    project_dirs.append((item, item_path))
+
+        if not project_dirs:
+            print("错误: 未找到任何包含文件的项目子目录")
+            sys.exit(1)
+
+        print(f"发现 {len(project_dirs)} 个项目目录:")
+        for name, _ in project_dirs:
+            file_count = sum(
+                len([f for f in files if os.path.isfile(os.path.join(root, f))])
+                for root, dirs, files in os.walk(os.path.join(batch_dir, name))
             )
-            if has_files:
-                project_dirs.append((item, item_path))
-
-    if not project_dirs:
-        print("错误: 未找到任何包含文件的项目子目录")
-        sys.exit(1)
-
-    print(f"发现 {len(project_dirs)} 个项目目录:")
-    for name, _ in project_dirs:
-        file_count = sum(
-            len([f for f in files if os.path.isfile(os.path.join(root, f))])
-            for root, dirs, files in os.walk(os.path.join(batch_dir, name))
-        )
-        print(f"  - {name}  ({file_count} 个文件)")
-    print()
+            print(f"  - {name}  ({file_count} 个文件)")
+        print()
 
     if preview:
         print("【预览模式】以下是批量处理计划（未实际执行）:")
         print()
-        for name, path in project_dirs:
-            try:
-                sr = scan_project(path, project_type, calculate_hash=False)
-                miss_rate_info = ""
-                if sr.unrecognized_count > 5:
-                    miss_rate_info = f" ⚠待确认较多"
-                print(f"  {name}: {sr.total_count}文件, {sr.unrecognized_count}待确认{miss_rate_info}")
-            except Exception as e:
-                print(f"  {name}: 扫描失败 - {e}")
+
+        if projects_from_list:
+            for p in projects_from_list:
+                try:
+                    sr = scan_project(p['path'], p['type'], calculate_hash=False)
+                    miss_rate_info = ""
+                    if sr.unrecognized_count > 5:
+                        miss_rate_info = f" ⚠待确认较多"
+                    print(f"  {p['name']}: {sr.total_count}文件, {sr.unrecognized_count}待确认{miss_rate_info}")
+                except Exception as e:
+                    print(f"  {p['name']}: 扫描失败 - {e}")
+        else:
+            for name, path in project_dirs:
+                try:
+                    sr = scan_project(path, project_type, calculate_hash=False)
+                    miss_rate_info = ""
+                    if sr.unrecognized_count > 5:
+                        miss_rate_info = f" ⚠待确认较多"
+                    print(f"  {name}: {sr.total_count}文件, {sr.unrecognized_count}待确认{miss_rate_info}")
+                except Exception as e:
+                    print(f"  {name}: 扫描失败 - {e}")
         print()
         print("如确认无误，去掉 --preview 参数即可正式执行批量处理")
         return
@@ -374,27 +451,47 @@ def cmd_batch(args):
     print("-" * 60)
 
     all_results = []
-    for name, path in project_dirs:
-        try:
-            r = process_single_project(path, name, project_type, output_path, copy_mode)
-        except Exception as e:
-            print(f"  [{name}] ✗ 处理异常: {e}")
-            r = {
-                "project_name": name,
-                "pt_name": pt.name,
-                "total": 0, "organized": 0, "void": 0, "unclassified": 0,
-                "missing": [], "category_counts": {}, "error": str(e)
-            }
-        all_results.append(r)
+    if projects_from_list:
+        for p in projects_from_list:
+            try:
+                r = process_single_project(p['path'], p['name'], p['type'], output_path, copy_mode, force_project_output=p.get('output'))
+            except Exception as e:
+                print(f"  [{p['name']}] ✗ 处理异常: {e}")
+                pt = get_project_type(p['type'])
+                pt_name = pt.name if pt else p['type']
+                r = {
+                    "project_name": p['name'],
+                    "pt_name": pt_name,
+                    "total": 0, "organized": 0, "void": 0, "unclassified": 0,
+                    "missing": [], "category_counts": {}, "error": str(e)
+                }
+            all_results.append(r)
+    else:
+        for name, path in project_dirs:
+            try:
+                r = process_single_project(path, name, project_type, output_path, copy_mode)
+            except Exception as e:
+                print(f"  [{name}] ✗ 处理异常: {e}")
+                pt = get_project_type(project_type)
+                pt_name = pt.name if pt else project_type
+                r = {
+                    "project_name": name,
+                    "pt_name": pt_name,
+                    "total": 0, "organized": 0, "void": 0, "unclassified": 0,
+                    "missing": [], "category_counts": {}, "error": str(e)
+                }
+            all_results.append(r)
 
     print("-" * 60)
     print()
 
     print("正在生成月底汇总表...")
     os.makedirs(output_path, exist_ok=True)
-    txt_path, csv_path = generate_monthly_summary(all_results, output_path)
+    txt_path, csv_path, detail_txt_path, detail_csv_path = generate_monthly_summary(all_results, output_path)
     print(f"  TXT 汇总表: {txt_path}")
     print(f"  CSV 汇总表: {csv_path}")
+    print(f"  TXT 明细表: {detail_txt_path}")
+    print(f"  CSV 明细表: {detail_csv_path}")
     print()
 
     ok_count = sum(1 for r in all_results if not r.get('error'))
@@ -411,6 +508,112 @@ def cmd_batch(args):
     print("=" * 60)
 
 
+def cmd_review(args):
+    output_path = args.output
+    project_path = args.project_path
+    project_type = args.project_type
+    is_batch = args.batch
+
+    if not os.path.isabs(output_path):
+        output_path = os.path.abspath(output_path)
+
+    print("=" * 60)
+    print("竣工资料组卷工具 - 复核阶段")
+    print("=" * 60)
+    print(f"输出目录: {output_path}")
+    if project_path:
+        print(f"项目路径: {project_path}")
+    if is_batch:
+        print(f"复核模式: 批量复核")
+    else:
+        print(f"复核模式: 单项目复核")
+        print(f"工程类型: {project_type}")
+    print()
+
+    if is_batch:
+        if not os.path.isdir(output_path):
+            print(f"错误: 批量输出目录不存在: {output_path}")
+            sys.exit(1)
+
+        print("开始批量复核...")
+        print("-" * 60)
+
+        results, report_path = verify_batch_output(output_path, project_type)
+
+        print("-" * 60)
+        print()
+
+        total_errors = sum(vr.error_count for vr in results)
+        total_warnings = sum(vr.warning_count for vr in results)
+
+        print(f"复核完成!")
+        print(f"  复核项目数: {len(results)}")
+        print(f"  发现错误: {total_errors} 个")
+        print(f"  发现警告: {total_warnings} 个")
+        print(f"  复核报告: {report_path}")
+        print()
+
+        if total_errors + total_warnings > 0:
+            print("=" * 60)
+            print("问题项目汇总:")
+            print("=" * 60)
+            for vr in results:
+                if vr.issues:
+                    print(f"  [{vr.project_name}] {vr.error_count}错 {vr.warning_count}警")
+                    for issue in vr.issues[:3]:
+                        icon = "❌" if issue.level == "错误" else "⚠️ "
+                        print(f"    {icon} {issue.type}: {issue.message}")
+                    if len(vr.issues) > 3:
+                        print(f"    ... 还有 {len(vr.issues) - 3} 个问题")
+            print()
+            print("详细问题请查看复核报告")
+        else:
+            print("✅ 所有项目复核通过，未发现不一致问题")
+    else:
+        if not project_path:
+            print("错误: 单项目复核必须指定 --project-path")
+            sys.exit(1)
+
+        if not os.path.isabs(project_path):
+            project_path = os.path.abspath(project_path)
+
+        if not os.path.isdir(project_path):
+            print(f"错误: 项目路径不存在: {project_path}")
+            sys.exit(1)
+
+        if not os.path.isdir(output_path):
+            print(f"错误: 输出目录不存在: {output_path}")
+            sys.exit(1)
+
+        pt = get_project_type(project_type)
+        if not pt:
+            print(f"错误: 不支持的工程类型 '{project_type}'")
+            sys.exit(1)
+
+        print("开始复核...")
+        vr, report_path = verify_organized_result(project_path, output_path, project_type)
+        print()
+
+        print(f"复核完成!")
+        print(f"  错误数: {vr.error_count}")
+        print(f"  警告数: {vr.warning_count}")
+        print(f"  复核报告: {report_path}")
+        print()
+
+        if vr.issues:
+            print("=" * 60)
+            print("发现的问题:")
+            print("=" * 60)
+            for idx, issue in enumerate(vr.issues, 1):
+                icon = "❌" if issue.level == "错误" else "⚠️ "
+                print(f"{idx:02d}. {icon} [{issue.level}] {issue.type}: {issue.message}")
+        else:
+            print("✅ 所有检查项通过，未发现不一致问题")
+
+    print()
+    print("=" * 60)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="juanzuan",
@@ -422,10 +625,19 @@ def main():
   2. 核对:  打开输出目录/待确认文件清单.txt 填写类别
   3. 预览:  python juanzuan_tool.py organize <项目路径> <输出> --preview
   4. 执行:  python juanzuan_tool.py organize <项目路径> <输出>
+  5. 复核:  python juanzuan_tool.py review <输出> --project-path <项目路径> --project-type <类型>
 
 批量流程:
-  1. 预览:  python juanzuan_tool.py batch <批量目录> <工程类型> <汇总输出> --preview
-  2. 执行:  python juanzuan_tool.py batch <批量目录> <工程类型> <汇总输出>
+  方式一（目录模式）:
+    1. 预览:  python juanzuan_tool.py batch <批量目录> <工程类型> <汇总输出> --preview
+    2. 执行:  python juanzuan_tool.py batch <批量目录> <工程类型> <汇总输出>
+    3. 复核:  python juanzuan_tool.py review <汇总输出> --batch
+
+  方式二（清单模式，支持混合类型）:
+    1. 准备CSV: 项目名称,路径,工程类型,输出目录,备注
+    2. 预览:  python juanzuan_tool.py batch --project-list 清单.csv <汇总输出> --preview
+    3. 执行:  python juanzuan_tool.py batch --project-list 清单.csv <汇总输出>
+    4. 复核:  python juanzuan_tool.py review <汇总输出> --batch
 
 查看支持类型:
   python juanzuan_tool.py list-types
@@ -456,12 +668,20 @@ def main():
     list_parser.set_defaults(func=cmd_list_types)
 
     batch_parser = subparsers.add_parser("batch", help="批量项目模式：自动处理多个项目目录，生成月底汇总")
-    batch_parser.add_argument("batch_dir", help="包含多个项目子文件夹的目录")
-    batch_parser.add_argument("project_type", help="工程类型: civil/industrial/municipal")
+    batch_parser.add_argument("batch_dir", nargs="?", default=None, help="包含多个项目子文件夹的目录（目录模式）")
+    batch_parser.add_argument("project_type", nargs="?", default="civil", help="工程类型: civil/industrial/municipal（目录模式）")
     batch_parser.add_argument("output", help="汇总输出位置路径")
+    batch_parser.add_argument("--project-list", help="项目清单CSV文件（清单模式，可混合工程类型）")
     batch_parser.add_argument("--move", action="store_true", help="移动文件而非复制 (默认: 复制)")
     batch_parser.add_argument("--preview", action="store_true", help="预览模式，只显示概况不实际执行")
     batch_parser.set_defaults(func=cmd_batch)
+
+    review_parser = subparsers.add_parser("review", help="复核已组卷结果的一致性")
+    review_parser.add_argument("output", help="已组卷的输出目录")
+    review_parser.add_argument("--project-path", help="原始项目路径（单项目复核时必需）")
+    review_parser.add_argument("--project-type", default="civil", help="工程类型 (默认: civil)")
+    review_parser.add_argument("--batch", action="store_true", help="批量复核模式，自动扫描所有_组卷结果子目录")
+    review_parser.set_defaults(func=cmd_review)
 
     args = parser.parse_args()
 

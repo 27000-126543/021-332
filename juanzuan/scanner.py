@@ -150,6 +150,17 @@ def generate_checklist(scan_result: ScanResult, project_path: str, output_path: 
 
     checklist_path = os.path.join(output_path, "待确认文件清单.txt")
 
+    existing_rules = []
+    existing_entries = {}
+    if os.path.exists(checklist_path):
+        try:
+            from .organizer import parse_checklist
+            existing_checked, existing_rules = parse_checklist(checklist_path)
+            for cf in existing_checked:
+                existing_entries[cf.path] = cf
+        except Exception:
+            pass
+
     lines = []
     lines.append("=" * 80)
     lines.append("竣工资料组卷 - 待确认文件清单")
@@ -165,6 +176,7 @@ def generate_checklist(scan_result: ScanResult, project_path: str, output_path: 
     lines.append("  【方式一】逐个指定：在下方每个待确认文件的【案卷类别】处填写编号或作废")
     lines.append("  【方式二】批量归类：编辑下方【批量归类规则】区块，按关键字或子目录批量指定")
     lines.append("  规则会先于逐个指定生效。填写完毕后保存，再运行 organize 命令")
+    lines.append("  【注意】重新执行scan时，已填写的规则和类别会自动保留")
     lines.append("-" * 80)
     lines.append("")
     lines.append("案卷类别对照表:")
@@ -184,8 +196,12 @@ def generate_checklist(scan_result: ScanResult, project_path: str, output_path: 
     lines.append("  KEYWORD|废弃文件|作废|标记为作废")
     lines.append("")
     lines.append("# 在此行下面添加您的批量归类规则（每行一条，去掉开头的#）：")
-    lines.append("# KEYWORD||")
-    lines.append("# SUBDIR||")
+    if existing_rules:
+        for r in existing_rules:
+            lines.append(f"{r.rule_type}|{r.rule_content}|{r.category_code}|{r.remark}")
+    else:
+        lines.append("# KEYWORD||")
+        lines.append("# SUBDIR||")
     lines.append("")
     lines.append("=" * 80)
     lines.append("待确认文件列表")
@@ -196,6 +212,16 @@ def generate_checklist(scan_result: ScanResult, project_path: str, output_path: 
         lines.append("（无不识别文件，所有文件均已自动分类）")
     else:
         for idx, fi in enumerate(scan_result.unrecognized_files, 1):
+            existing = existing_entries.get(fi.path)
+            cat_display = "____"
+            remark_display = ""
+            if existing:
+                if existing.is_void:
+                    cat_display = "作废"
+                elif existing.category_code:
+                    cat_display = existing.category_code
+                remark_display = existing.remark or ""
+
             lines.append(f"[{idx:04d}] 文件名: {fi.filename}")
             lines.append(f"       相对路径: {fi.path}")
             lines.append(f"       所在子目录: {fi.subdir or '根目录'}")
@@ -203,8 +229,8 @@ def generate_checklist(scan_result: ScanResult, project_path: str, output_path: 
             lines.append(f"       识别到的单位工程: {fi.unit or '无'}")
             lines.append(f"       识别到的日期: {fi.date or '无'}")
             lines.append(f"       识别到的编号: {fi.number or '无'}")
-            lines.append(f"       【案卷类别】: ____")
-            lines.append(f"       【备注】: ")
+            lines.append(f"       【案卷类别】: {cat_display}")
+            lines.append(f"       【备注】: {remark_display}")
             lines.append("")
 
     lines.append("")
@@ -289,7 +315,7 @@ def generate_preliminary_list(scan_result: ScanResult, output_path: str, project
         for idx, fi in enumerate(files_sorted, 1):
             unit_info = f"[{fi.unit}]" if fi.unit else ""
             date_info = f"({fi.date})" if fi.date else ""
-            num_info = f"-{fi.number}" if fi.number else ""
+            num_info = f"#{fi.number}" if fi.number else ""
             lines.append(f"  {idx:03d}. {unit_info}{date_info}{num_info} {fi.filename}")
 
         lines.append("")
@@ -298,7 +324,7 @@ def generate_preliminary_list(scan_result: ScanResult, output_path: str, project
     lines.append(f"【未分类】 ({scan_result.unrecognized_count}个文件)")
     lines.append("-" * 80)
     for idx, fi in enumerate(scan_result.unrecognized_files, 1):
-        num_info = f"-{fi.number}" if fi.number else ""
+        num_info = f"#{fi.number}" if fi.number else ""
         date_info = f"({fi.date})" if fi.date else ""
         lines.append(f"  {idx:03d}. {date_info}{num_info} {fi.filename}")
     lines.append("")
