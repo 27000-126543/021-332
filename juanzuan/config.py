@@ -97,8 +97,11 @@ DATE_PATTERNS = [
 NUMBER_PATTERNS = [
     r'(?P<number>№\s*\d+)',
     r'(?P<number>编号[:：]?\s*\d+)',
-    r'(?P<number>\d{2,4}-\d{3,4})',
+    r'(?P<number>\d{4}-\d{3,4})',
+    r'(?P<number>\d{2,4}-\d{1,4}(?![\d]))',
     r'(?P<number>第[一二三四五六七八九十百千0-9]+[号份])',
+    r'[-_\s](?P<number>\d{2,4})(?=\.[^.]+$)',
+    r'[-_\s](?P<number>\d{2,4})(?=[-_\s]|$)',
 ]
 
 
