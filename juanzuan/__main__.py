@@ -1,6 +1,7 @@
 import argparse
 import sys
 import os
+from typing import List, Dict, Optional
 
 from . import __version__
 from .config import list_project_types, get_project_type
@@ -513,6 +514,7 @@ def cmd_review(args):
     project_path = args.project_path
     project_type = args.project_type
     is_batch = args.batch
+    project_list = getattr(args, 'project_list', None)
 
     if not os.path.isabs(output_path):
         output_path = os.path.abspath(output_path)
@@ -525,6 +527,8 @@ def cmd_review(args):
         print(f"项目路径: {project_path}")
     if is_batch:
         print(f"复核模式: 批量复核")
+        if project_list:
+            print(f"项目清单: {project_list}")
     else:
         print(f"复核模式: 单项目复核")
         print(f"工程类型: {project_type}")
@@ -538,7 +542,13 @@ def cmd_review(args):
         print("开始批量复核...")
         print("-" * 60)
 
-        results, report_path = verify_batch_output(output_path, project_type)
+        csv_path = None
+        if project_list:
+            if not os.path.isabs(project_list):
+                project_list = os.path.abspath(project_list)
+            csv_path = project_list
+
+        results, report_path = verify_batch_output(output_path, project_type, project_list_csv=csv_path)
 
         print("-" * 60)
         print()
@@ -681,6 +691,7 @@ def main():
     review_parser.add_argument("--project-path", help="原始项目路径（单项目复核时必需）")
     review_parser.add_argument("--project-type", default="civil", help="工程类型 (默认: civil)")
     review_parser.add_argument("--batch", action="store_true", help="批量复核模式，自动扫描所有_组卷结果子目录")
+    review_parser.add_argument("--project-list", help="项目清单CSV（批量复核时使用，支持自定义输出目录）")
     review_parser.set_defaults(func=cmd_review)
 
     args = parser.parse_args()

@@ -764,11 +764,88 @@ class VerifyResult:
         return sum(1 for i in self.issues if i.level == "警告")
 
 
+def parse_volume_catalog(catalog_path: str) -> Dict[str, Dict]:
+    if not os.path.exists(catalog_path):
+        return {}
+
+    with open(catalog_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    volumes = {}
+    current_vol = None
+
+    for line in content.split('\n'):
+        m = re.match(r'^卷\s*(\d+):\s*(.+?)\s*$', line)
+        if m:
+            vol_num = m.group(1)
+            vol_dir = m.group(2).strip()
+            current_vol = vol_dir
+            volumes[current_vol] = {"卷号": vol_num, "文件数": None, "文件列表": []}
+            continue
+
+        if current_vol and current_vol in volumes:
+            m2 = re.match(r'^\s*文件数:\s*(\d+)', line)
+            if m2:
+                volumes[current_vol]["文件数"] = int(m2.group(1))
+
+    return volumes
+
+
+def collect_actual_volumes(output_path: str) -> Dict[str, List[str]]:
+    actual = {}
+    if not os.path.isdir(output_path):
+        return actual
+
+    for item in sorted(os.listdir(output_path)):
+        item_path = os.path.join(output_path, item)
+        if not os.path.isdir(item_path):
+            continue
+        if item in ("00_作废文件", "01_待分类文件"):
+            continue
+        if item.startswith("00_") or item.startswith("01_"):
+            continue
+        files = [f for f in os.listdir(item_path)
+                 if os.path.isfile(os.path.join(item_path, f)) and f != "卷内目录.txt"]
+        actual[item] = sorted(files)
+
+    return actual
+
+
+def collect_actual_void_unclassified(output_path: str) -> Tuple[List[str], List[str]]:
+    void_files = []
+    unclassified_files = []
+
+    void_dir = os.path.join(output_path, "00_作废文件")
+    if os.path.isdir(void_dir):
+        void_files = sorted([f for f in os.listdir(void_dir)
+                             if os.path.isfile(os.path.join(void_dir, f))])
+
+    unc_dir = os.path.join(output_path, "01_待分类文件")
+    if os.path.isdir(unc_dir):
+        unclassified_files = sorted([f for f in os.listdir(unc_dir)
+                                     if os.path.isfile(os.path.join(unc_dir, f))])
+
+    return void_files, unclassified_files
+
+
+def parse_missing_report(missing_path: str) -> List[str]:
+    if not os.path.exists(missing_path):
+        return []
+
+    with open(missing_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    missing = []
+    for line in content.split('\n'):
+        m = re.match(r'^\s*✗\s*(\S+)\s*-\s*(.+)', line)
+        if m:
+            missing.append(m.group(1))
+    return missing
+
+
 def verify_organized_result(project_path: str, output_path: str, project_type: str) -> Tuple[VerifyResult, str]:
-    """
-    复核已组卷的结果：核对卷内目录、缺项统计、重复文件清单的一致性
-    """
     from .scanner import scan_project
+    from datetime import datetime
 
     vr = VerifyResult(project_path=project_path, project_name=os.path.basename(project_path.rstrip(os.sep)))
 
@@ -784,7 +861,7 @@ def verify_organized_result(project_path: str, output_path: str, project_type: s
     report_lines.append(f"项目路径: {project_path}")
     report_lines.append(f"输出目录: {output_path}")
     report_lines.append(f"工程类型: {project_type}")
-    report_lines.append(f"复核时间: {os.popen('date /t').read().strip()} {os.popen('time /t').read().strip()}")
+    report_lines.append(f"复核时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     report_lines.append("")
 
     print(f"  正在重新扫描源文件...", end="", flush=True)
@@ -796,81 +873,111 @@ def verify_organized_result(project_path: str, output_path: str, project_type: s
         report_lines.append("❌ 源文件扫描失败")
         return vr, "\n".join(report_lines)
 
-    print(f" 检查卷内目录...", end="", flush=True)
+    print(f" 核对卷内目录...", end="", flush=True)
+
+    actual_volumes = collect_actual_volumes(output_path)
+    actual_void, actual_unclassified = collect_actual_void_unclassified(output_path)
+    total_organized = sum(len(v) for v in actual_volumes.values())
 
     catalog_path = os.path.join(output_path, "卷内目录.txt")
-    expected_volumes = set()
-    actual_volume_files = defaultdict(list)
-
-    if os.path.isdir(output_path):
-        for item in os.listdir(output_path):
-            item_path = os.path.join(output_path, item)
-            if os.path.isdir(item_path) and not item.startswith("00_") and not item.startswith("01_"):
-                volume_files = [f for f in os.listdir(item_path)
-                                if os.path.isfile(os.path.join(item_path, f)) and f != "卷内目录.txt"]
-                actual_volume_files[item] = volume_files
-
-    total_organized = sum(len(v) for v in actual_volume_files.values())
+    catalog_volumes = parse_volume_catalog(catalog_path)
 
     if not os.path.exists(catalog_path):
         vr.issues.append(VerifyIssue("警告", "卷内目录", vr.project_name, "卷内目录.txt 不存在"))
     else:
         vr.checked_items["卷内目录"] = True
 
+        for vol_name, vol_info in catalog_volumes.items():
+            vol_path = os.path.join(output_path, vol_name)
+            if not os.path.isdir(vol_path):
+                vr.issues.append(VerifyIssue("错误", "卷内目录", vr.project_name,
+                                             f"目录 {vol_name} 在卷内目录中有记录，但实际文件夹不存在"))
+                continue
+
+            catalog_count = vol_info.get("文件数")
+            actual_files = actual_volumes.get(vol_name, [])
+            actual_count = len(actual_files)
+
+            if catalog_count is not None and catalog_count != actual_count:
+                vr.issues.append(VerifyIssue("警告", "卷内目录", vr.project_name,
+                                             f"案卷 {vol_name} 文件数不一致：目录记录 {catalog_count} 个，实际 {actual_count} 个"))
+
+            vol_catalog_path = os.path.join(vol_path, "卷内目录.txt")
+            if os.path.exists(vol_catalog_path):
+                try:
+                    with open(vol_catalog_path, 'r', encoding='utf-8') as f:
+                        vol_cat_content = f.read()
+                    listed_files = []
+                    in_data = False
+                    for line in vol_cat_content.split('\n'):
+                        if '---' in line and not in_data:
+                            in_data = True
+                            continue
+                        if not in_data:
+                            continue
+                        if line.startswith('本卷共') or not line.strip():
+                            continue
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            candidate = parts[1]
+                            if '.' in candidate:
+                                listed_files.append(candidate)
+
+                    if len(listed_files) != actual_count:
+                        vr.issues.append(VerifyIssue("警告", "卷内目录", vr.project_name,
+                                                     f"案卷 {vol_name} 子目录记录 {len(listed_files)} 个文件，实际 {actual_count} 个"))
+
+                    for af in actual_files:
+                        if af not in listed_files and len(listed_files) > 0:
+                            vr.issues.append(VerifyIssue("警告", "卷内目录", vr.project_name,
+                                                         f"案卷 {vol_name} 中文件 {af} 存在于磁盘但未在卷内目录中列出"))
+                except Exception:
+                    pass
+
+        for vol_name in actual_volumes:
+            if vol_name not in catalog_volumes:
+                vr.issues.append(VerifyIssue("警告", "卷内目录", vr.project_name,
+                                             f"案卷 {vol_name} 文件夹存在但未在卷内总目录中记录（文件数: {len(actual_volumes[vol_name])}）"))
+
+    print(f" 核对缺项...", end="", flush=True)
+
     pt = get_project_type(project_type)
+    all_categories = set()
+    present_categories = set()
+    expected_missing = []
+
     if pt:
         all_categories = {vc.code for vc in pt.volume_categories}
-        expected_missing = set()
-        present_categories = set()
-
-        for folder_name in actual_volume_files.keys():
+        for folder_name in actual_volumes.keys():
             parts = folder_name.split("_", 1)
-            if parts:
-                cat_code = parts[0]
-                if cat_code in all_categories:
-                    present_categories.add(cat_code)
-
+            if parts and parts[0] in all_categories:
+                present_categories.add(parts[0])
         expected_missing = sorted(all_categories - present_categories)
 
         missing_path = os.path.join(output_path, "缺项统计.txt")
         if os.path.exists(missing_path):
             vr.checked_items["缺项统计"] = True
-            try:
-                with open(missing_path, 'r', encoding='utf-8') as f:
-                    missing_content = f.read()
-                reported_missing = []
-                for cat in all_categories:
-                    if f"✗ {cat}" in missing_content or f"{cat} -" in missing_content:
-                        has_files = False
-                        for folder_name in actual_volume_files.keys():
-                            if folder_name.startswith(cat + "_"):
-                                has_files = True
-                                break
-                        if not has_files:
-                            reported_missing.append(cat)
+            reported_missing = parse_missing_report(missing_path)
+            if set(expected_missing) != set(reported_missing):
+                extra = set(reported_missing) - set(expected_missing)
+                missing = set(expected_missing) - set(reported_missing)
+                detail = ""
+                if extra:
+                    detail += f" 报告多写: {sorted(extra)}"
+                if missing:
+                    detail += f" 报告漏写: {sorted(missing)}"
+                vr.issues.append(VerifyIssue(
+                    "警告", "缺项统计", vr.project_name,
+                    f"缺项不一致。实际缺项: {expected_missing}, 报告缺项: {reported_missing}。{detail}"
+                ))
+        else:
+            vr.issues.append(VerifyIssue("警告", "缺项统计", vr.project_name, "缺项统计.txt 不存在"))
 
-                if set(expected_missing) != set(reported_missing):
-                    vr.issues.append(VerifyIssue(
-                        "警告", "缺项统计", vr.project_name,
-                        f"缺项不一致。实际缺项: {expected_missing}, 报告缺项: {reported_missing}"
-                    ))
-            except Exception as e:
-                vr.issues.append(VerifyIssue("警告", "缺项统计", vr.project_name, f"解析缺项统计失败: {e}"))
+    print(f" 核对重复清单...", end="", flush=True)
 
     dup_path = os.path.join(output_path, "重复文件清单.txt")
     if os.path.exists(dup_path):
         vr.checked_items["重复文件清单"] = True
-        if scan_result.duplicates:
-            try:
-                with open(dup_path, 'r', encoding='utf-8') as f:
-                    dup_content = f.read()
-                if f"重复文件组数: {len(scan_result.duplicates)}" not in dup_content:
-                    vr.issues.append(VerifyIssue(
-                        "警告", "重复文件清单", vr.project_name,
-                        f"重复文件组数不一致。实际: {len(scan_result.duplicates)}组, 报告中可能有误"
-                    ))
-            except Exception as e:
-                vr.issues.append(VerifyIssue("警告", "重复文件清单", vr.project_name, f"解析失败: {e}"))
     elif scan_result.duplicates:
         vr.issues.append(VerifyIssue(
             "警告", "重复文件清单", vr.project_name,
@@ -882,22 +989,47 @@ def verify_organized_result(project_path: str, output_path: str, project_type: s
         vr.checked_items["核对清单"] = True
 
     report_lines.append("-" * 100)
-    report_lines.append("复核内容:")
-    report_lines.append(f"  ✓ 源文件扫描: {scan_result.total_count} 个文件")
-    report_lines.append(f"  ✓ 检测到重复: {scan_result.duplicate_count} 个文件 ({len(scan_result.duplicates)}组)")
-    report_lines.append(f"  ✓ 已组卷文件: {total_organized} 个 (在 {len(actual_volume_files)} 个案卷中)")
+    report_lines.append("一、源文件扫描:")
+    report_lines.append(f"  文件总数: {scan_result.total_count}")
+    report_lines.append(f"  已识别: {scan_result.recognized_count}")
+    report_lines.append(f"  待确认: {scan_result.unrecognized_count}")
+    report_lines.append(f"  重复文件: {scan_result.duplicate_count} 个 ({len(scan_result.duplicates)}组)")
     report_lines.append("")
 
     report_lines.append("-" * 100)
-    report_lines.append("案卷核对:")
-    report_lines.append(f"{'案卷':<24}{'文件数':>10}{'状态':<10}")
-    report_lines.append("-" * 50)
-    for vol_name, files in sorted(actual_volume_files.items()):
-        report_lines.append(f"  {vol_name:<22}{len(files):>10}  ✓ 正常")
+    report_lines.append("二、案卷核对（卷内目录 vs 实际文件）:")
+    report_lines.append(f"{'案卷名称':<28}{'目录记录数':>10}{'实际文件数':>10}{'状态':<10}")
+    report_lines.append("-" * 60)
+
+    for vol_name in sorted(set(list(catalog_volumes.keys()) + list(actual_volumes.keys()))):
+        cat_count = catalog_volumes.get(vol_name, {}).get("文件数")
+        act_count = len(actual_volumes.get(vol_name, []))
+
+        if cat_count is None and act_count == 0:
+            continue
+        if vol_name not in catalog_volumes:
+            status = "⚠ 目录漏记"
+        elif vol_name not in actual_volumes:
+            status = "❌ 文件夹缺失"
+        elif cat_count == act_count:
+            status = "✓ 一致"
+        else:
+            status = f"⚠ 不一致({cat_count}≠{act_count})"
+
+        cat_display = str(cat_count) if cat_count is not None else "无记录"
+        report_lines.append(f"  {vol_name:<26}{cat_display:>10}{act_count:>10}  {status}")
+
     report_lines.append("")
 
+    void_count = len(actual_void)
+    unclassified_count = len(actual_unclassified)
+    report_lines.append(f"  作废文件: {void_count} 个")
+    report_lines.append(f"  待分类文件: {unclassified_count} 个")
+    report_lines.append("")
+
+    report_lines.append("-" * 100)
+    report_lines.append("三、缺项核对:")
     if expected_missing:
-        report_lines.append(f"缺项类别 ({len(expected_missing)}个):")
         for m in expected_missing:
             cat_name = ""
             if pt:
@@ -906,7 +1038,54 @@ def verify_organized_result(project_path: str, output_path: str, project_type: s
                         cat_name = vc.name
                         break
             report_lines.append(f"  ✗ {m} - {cat_name}")
-        report_lines.append("")
+    else:
+        report_lines.append("  ✓ 无缺项")
+    report_lines.append("")
+
+    report_lines.append("-" * 100)
+    report_lines.append("四、统计数字核对:")
+    organized_from_folders = total_organized
+    void_from_folders = void_count
+    unclassified_from_folders = unclassified_count
+    total_from_folders = organized_from_folders + void_from_folders + unclassified_from_folders
+    report_lines.append(f"  输出目录实际文件总数: {total_from_folders}")
+    report_lines.append(f"    已组卷: {organized_from_folders}")
+    report_lines.append(f"    作废: {void_from_folders}")
+    report_lines.append(f"    待分类: {unclassified_from_folders}")
+    report_lines.append("")
+
+    summary_path = os.path.join(output_path, "组卷汇总报告.txt")
+    if os.path.exists(summary_path):
+        try:
+            with open(summary_path, 'r', encoding='utf-8') as f:
+                summary_content = f.read()
+            m = re.search(r'文件总数:\s*(\d+)', summary_content)
+            report_total = int(m.group(1)) if m else None
+            m = re.search(r'已组卷文件:\s*(\d+)', summary_content)
+            report_organized = int(m.group(1)) if m else None
+            m = re.search(r'作废文件:\s*(\d+)', summary_content)
+            report_void = int(m.group(1)) if m else None
+            m = re.search(r'待分类文件:\s*(\d+)', summary_content)
+            report_unclassified = int(m.group(1)) if m else None
+
+            if report_total is not None and report_total != total_from_folders:
+                vr.issues.append(VerifyIssue("警告", "汇总报告", vr.project_name,
+                                             f"总文件数不一致：报告 {report_total}，实际 {total_from_folders}"))
+            if report_organized is not None and report_organized != organized_from_folders:
+                vr.issues.append(VerifyIssue("警告", "汇总报告", vr.project_name,
+                                             f"已组卷数不一致：报告 {report_organized}，实际 {organized_from_folders}"))
+            if report_void is not None and report_void != void_from_folders:
+                vr.issues.append(VerifyIssue("警告", "汇总报告", vr.project_name,
+                                             f"作废数不一致：报告 {report_void}，实际 {void_from_folders}"))
+            if report_unclassified is not None and report_unclassified != unclassified_from_folders:
+                vr.issues.append(VerifyIssue("警告", "汇总报告", vr.project_name,
+                                             f"待分类数不一致：报告 {report_unclassified}，实际 {unclassified_from_folders}"))
+
+            report_lines.append(f"  汇总报告记录: 总{report_total} 组卷{report_organized} 作废{report_void} 待分{report_unclassified}")
+        except Exception as e:
+            report_lines.append(f"  ⚠ 解析汇总报告失败: {e}")
+
+    report_lines.append("")
 
     if vr.issues:
         report_lines.append("=" * 100)
@@ -927,36 +1106,78 @@ def verify_organized_result(project_path: str, output_path: str, project_type: s
     return vr, report_path
 
 
-def verify_batch_output(batch_output_path: str, project_type: str = None) -> Tuple[List[VerifyResult], str]:
-    """
-    复核批量输出目录下的所有项目
-    """
+def verify_batch_output(batch_output_path: str, project_type: str = None,
+                        project_list_csv: str = None) -> Tuple[List[VerifyResult], str]:
+    from datetime import datetime
+
     results = []
     report_lines = []
     report_lines.append("=" * 100)
     report_lines.append("竣工资料组卷 - 批量复核报告")
     report_lines.append("=" * 100)
     report_lines.append(f"批量输出目录: {batch_output_path}")
-    report_lines.append(f"复核时间: {os.popen('date /t').read().strip()} {os.popen('time /t').read().strip()}")
+    report_lines.append(f"复核时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     report_lines.append("")
 
     project_dirs = []
-    if os.path.isdir(batch_output_path):
-        for item in sorted(os.listdir(batch_output_path)):
-            item_path = os.path.join(batch_output_path, item)
-            if os.path.isdir(item_path) and item.endswith("_组卷结果"):
-                project_dirs.append(item_path)
+
+    if project_list_csv and os.path.exists(project_list_csv):
+        try:
+            from .__main__ import parse_project_list
+            projects = parse_project_list(project_list_csv)
+            report_lines.append(f"使用项目清单: {project_list_csv}")
+            report_lines.append(f"清单中共 {len(projects)} 个项目")
+            report_lines.append("")
+
+            for p in projects:
+                if p.get('output'):
+                    proj_output = os.path.abspath(p['output'])
+                else:
+                    proj_output = os.path.join(batch_output_path, p['name'] + "_组卷结果")
+
+                if os.path.isdir(proj_output):
+                    project_dirs.append((p['name'], p['path'], p['type'], proj_output))
+                else:
+                    vr = VerifyResult(project_path=p['path'], project_name=p['name'])
+                    vr.issues.append(VerifyIssue("错误", "目录检查", p['name'],
+                                                 f"输出目录不存在: {proj_output}"))
+                    results.append(vr)
+        except Exception as e:
+            report_lines.append(f"⚠️  解析项目清单失败: {e}，回退到自动扫描模式")
+            project_dirs = []
 
     if not project_dirs:
-        report_lines.append("未找到任何项目的组卷结果目录")
-        return [], "\n".join(report_lines)
+        if os.path.isdir(batch_output_path):
+            for item in sorted(os.listdir(batch_output_path)):
+                item_path = os.path.join(batch_output_path, item)
+                if os.path.isdir(item_path) and item.endswith("_组卷结果"):
+                    proj_name = item.replace("_组卷结果", "")
+                    project_dirs.append((proj_name, None, None, item_path))
 
-    report_lines.append(f"发现 {len(project_dirs)} 个项目的组卷结果")
+    if not project_dirs and not results:
+        report_lines.append("未找到任何项目的组卷结果目录")
+        batch_report_path = os.path.join(batch_output_path, "批量复核报告.txt")
+        os.makedirs(batch_output_path, exist_ok=True)
+        with open(batch_report_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(report_lines))
+        return [], batch_report_path
+
+    report_lines.append(f"共 {len(project_dirs)} 个项目待复核")
     report_lines.append("")
 
     summary_path = os.path.join(batch_output_path, "月底汇总表.csv")
+    summary_data = {}
     if os.path.exists(summary_path):
-        report_lines.append("✓ 月底汇总表.csv 存在")
+        try:
+            with open(summary_path, 'r', encoding='utf-8-sig') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    name = row.get('项目名称', '').strip()
+                    if name:
+                        summary_data[name] = row
+            report_lines.append(f"✓ 月底汇总表.csv 存在（{len(summary_data)} 个项目记录）")
+        except Exception as e:
+            report_lines.append(f"⚠️  解析月底汇总表.csv 失败: {e}")
     else:
         report_lines.append("⚠️  月底汇总表.csv 不存在")
 
@@ -967,46 +1188,81 @@ def verify_batch_output(batch_output_path: str, project_type: str = None) -> Tup
         report_lines.append("⚠️  月底汇总表_明细表.csv 不存在")
     report_lines.append("")
 
-    for proj_output in project_dirs:
-        proj_name = os.path.basename(proj_output).replace("_组卷结果", "")
+    for proj_name, proj_source, proj_type, proj_output in project_dirs:
         print(f"  正在复核 [{proj_name}]...", end="", flush=True)
 
-        proj_source = None
-        checklist_path = os.path.join(proj_output, "待确认文件清单.txt")
-        detected_type = project_type
-        if os.path.exists(checklist_path):
-            try:
-                with open(checklist_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                m = re.search(r'项目路径:\s*(.+?)\s*\n', content)
-                if m:
-                    proj_source = m.group(1).strip()
-                m = re.search(r'工程类型:\s*(.+?)\s*\n', content)
-                if m:
-                    type_name = m.group(1).strip()
-                    for code, name in [("civil", "民用建筑工程"), ("industrial", "工业建筑工程"), ("municipal", "市政公用工程")]:
-                        if name == type_name:
-                            detected_type = code
-                            break
-            except Exception:
-                pass
+        detected_type = proj_type
+        if not detected_type:
+            checklist_path = os.path.join(proj_output, "待确认文件清单.txt")
+            if os.path.exists(checklist_path):
+                try:
+                    with open(checklist_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    m = re.search(r'工程类型:\s*(.+?)\s*\n', content)
+                    if m:
+                        type_name = m.group(1).strip()
+                        for code, name in [("civil", "民用建筑工程"), ("industrial", "工业建筑工程"), ("municipal", "市政公用工程")]:
+                            if name == type_name:
+                                detected_type = code
+                                break
+                except Exception:
+                    pass
 
-        if not proj_source or not os.path.isdir(proj_source):
-            for possible_name in [proj_name, proj_name.replace("01_", "").replace("02_", "").replace("03_", "")]:
-                for base_dir in [os.path.dirname(batch_output_path)]:
-                    test_path = os.path.join(base_dir, possible_name)
-                    if os.path.isdir(test_path):
-                        proj_source = test_path
-                        break
+        if not detected_type:
+            detected_type = project_type or "civil"
 
-        if not proj_source or not os.path.isdir(proj_source):
+        actual_source = proj_source
+        if not actual_source or not os.path.isdir(actual_source):
+            checklist_path = os.path.join(proj_output, "待确认文件清单.txt")
+            if os.path.exists(checklist_path):
+                try:
+                    with open(checklist_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    m = re.search(r'项目路径:\s*(.+?)\s*\n', content)
+                    if m:
+                        actual_source = m.group(1).strip()
+                except Exception:
+                    pass
+
+        if not actual_source or not os.path.isdir(actual_source):
             vr = VerifyResult(project_path="未知", project_name=proj_name)
             vr.issues.append(VerifyIssue("错误", "项目路径", proj_name, "无法定位原始项目路径，跳过复核"))
             results.append(vr)
             print(f" ✗ 找不到源文件")
             continue
 
-        vr, _ = verify_organized_result(proj_source, proj_output, detected_type or "civil")
+        vr, _ = verify_organized_result(actual_source, proj_output, detected_type)
+
+        csv_row = summary_data.get(proj_name)
+        if csv_row:
+            actual_volumes = collect_actual_volumes(proj_output)
+            actual_void, actual_unclassified = collect_actual_void_unclassified(proj_output)
+            re_total = len(actual_void) + len(actual_unclassified) + sum(len(v) for v in actual_volumes.values())
+            re_organized = sum(len(v) for v in actual_volumes.values())
+            re_void = len(actual_void)
+            re_unclassified = len(actual_unclassified)
+
+            try:
+                csv_total = int(csv_row.get('总文件数', 0))
+                csv_organized = int(csv_row.get('已组卷', 0))
+                csv_void = int(csv_row.get('作废', 0))
+                csv_unclassified = int(csv_row.get('待分类', 0))
+
+                if re_total != csv_total:
+                    vr.issues.append(VerifyIssue("警告", "汇总表核对", proj_name,
+                                                 f"总文件数不一致：CSV记录 {csv_total}，实际 {re_total}"))
+                if re_organized != csv_organized:
+                    vr.issues.append(VerifyIssue("警告", "汇总表核对", proj_name,
+                                                 f"已组卷数不一致：CSV记录 {csv_organized}，实际 {re_organized}"))
+                if re_void != csv_void:
+                    vr.issues.append(VerifyIssue("警告", "汇总表核对", proj_name,
+                                                 f"作废数不一致：CSV记录 {csv_void}，实际 {re_void}"))
+                if re_unclassified != csv_unclassified:
+                    vr.issues.append(VerifyIssue("警告", "汇总表核对", proj_name,
+                                                 f"待分类数不一致：CSV记录 {csv_unclassified}，实际 {re_unclassified}"))
+            except (ValueError, TypeError):
+                pass
+
         results.append(vr)
         status = f" ✗ {vr.error_count}错{vr.warning_count}警" if (vr.error_count + vr.warning_count) > 0 else " ✓"
         print(status)
@@ -1028,18 +1284,40 @@ def verify_batch_output(batch_output_path: str, project_type: str = None) -> Tup
     report_lines.append(f"  {'合计':<22}{total_errors:>8}{total_warnings:>8}")
     report_lines.append("")
 
-    if total_errors + total_warnings > 0:
+    csv_mismatch_projects = [vr for vr in results if any(i.type == "汇总表核对" for i in vr.issues)]
+    if csv_mismatch_projects:
         report_lines.append("=" * 100)
-        report_lines.append("问题详情:")
+        report_lines.append("月底汇总表数据差异:")
+        report_lines.append("=" * 100)
+        for vr in csv_mismatch_projects:
+            csv_issues = [i for i in vr.issues if i.type == "汇总表核对"]
+            report_lines.append(f"\n【{vr.project_name}】")
+            for issue in csv_issues:
+                icon = "❌" if issue.level == "错误" else "⚠️ "
+                report_lines.append(f"  {icon} {issue.message}")
+
+    all_issues = [i for vr in results for i in vr.issues if i.type != "汇总表核对"]
+    if all_issues:
+        report_lines.append("")
+        report_lines.append("=" * 100)
+        report_lines.append("其他问题详情:")
         report_lines.append("=" * 100)
         for vr in results:
-            if vr.issues:
+            non_csv_issues = [i for i in vr.issues if i.type != "汇总表核对"]
+            if non_csv_issues:
                 report_lines.append(f"\n【{vr.project_name}】")
-                for idx, issue in enumerate(vr.issues, 1):
+                for idx, issue in enumerate(non_csv_issues, 1):
                     icon = "❌" if issue.level == "错误" else "⚠️ "
                     report_lines.append(f"  {idx:02d}. {icon} [{issue.level}] {issue.type}: {issue.message}")
 
+    if total_errors + total_warnings == 0:
+        report_lines.append("")
+        report_lines.append("=" * 100)
+        report_lines.append("✅ 所有项目复核通过，数据一致")
+        report_lines.append("=" * 100)
+
     batch_report_path = os.path.join(batch_output_path, "批量复核报告.txt")
+    os.makedirs(batch_output_path, exist_ok=True)
     with open(batch_report_path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(report_lines))
 
